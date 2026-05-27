@@ -61,6 +61,9 @@ log = logging.getLogger("tg_sync")
 
 # ── Google Auth ───────────────────────────────────────────────────────────────
 
+GOOGLE_AUTH_PORT = 8080
+
+
 def get_google_creds(headless: bool = True) -> Credentials:
     creds = None
     if TOKEN_FILE.exists():
@@ -74,8 +77,10 @@ def get_google_creds(headless: bool = True) -> Credentials:
                 sys.exit(f"ERROR: {CREDS_FILE} not found. Download OAuth2 Desktop credentials from Google Cloud Console.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), GOOGLE_SCOPES)
             if headless:
-                # Prints URL, waits for pasted code — works on headless VM
-                creds = flow.run_console()
+                # Headless: local HTTP server on fixed port, use SSH tunnel:
+                #   ssh -L 8080:localhost:8080 ubuntu@VM "python sync.py --auth-only"
+                # Then open the printed URL in your local browser.
+                creds = flow.run_local_server(port=GOOGLE_AUTH_PORT, open_browser=False)
             else:
                 creds = flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json())
