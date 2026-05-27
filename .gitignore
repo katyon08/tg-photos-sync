@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+token_google.json
+credentials.json
+state.json
+sync.log
+__pycache__/
+*.pyc
+venv/

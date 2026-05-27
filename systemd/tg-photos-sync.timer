@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram Photos Sync monthly
+
+[Timer]
+# 1st day of each month at 03:00
+OnCalendar=*-*-01 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Photos Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tg-photos-sync
+ExecStart=/home/ubuntu/tg-photos-sync/venv/bin/python sync.py
+StandardOutput=journal
+StandardError=journal
+# Pull latest code before each run
+ExecStartPre=/usr/bin/git -C /home/ubuntu/tg-photos-sync pull --ff-only
+
+[Install]
+WantedBy=multi-user.target
