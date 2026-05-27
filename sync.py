@@ -78,9 +78,19 @@ def get_google_creds(headless: bool = True) -> Credentials:
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), GOOGLE_SCOPES)
             if headless:
                 # Headless: local HTTP server on fixed port, use SSH tunnel:
-                #   ssh -L 8080:localhost:8080 ubuntu@VM "python sync.py --auth-only"
+                #   ssh -L 8080:localhost:8080 ubuntu@VM "python -u sync.py --auth-only"
                 # Then open the printed URL in your local browser.
-                creds = flow.run_local_server(port=GOOGLE_AUTH_PORT, open_browser=False)
+                creds = flow.run_local_server(
+                    port=GOOGLE_AUTH_PORT,
+                    open_browser=False,
+                    authorization_prompt_message=(
+                        "\n" + "=" * 60 + "\n"
+                        "Open this URL in your browser:\n\n"
+                        "{url}\n\n"
+                        "=" * 60 + "\n"
+                        "Waiting for Google redirect to localhost:8080 ...\n"
+                    ),
+                )
             else:
                 creds = flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json())
