@@ -29,13 +29,23 @@ SESSION_FILE = str(BASE_DIR / "tg")
 LOG_FILE    = BASE_DIR / "sync.log"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-TG_API_ID    = int(os.environ["TG_API_ID"])
-TG_API_HASH  = os.environ["TG_API_HASH"]
-TG_PHONE     = os.environ["TG_PHONE"]
-TG_DIALOG    = os.environ.get("TG_DIALOG", "@anna133456")
-ALBUM_NAME   = os.environ.get("ALBUM_NAME", "Telegram - Anna")
-NOTIFY_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
-NOTIFY_CHAT  = os.environ.get("NOTIFY_CHAT_ID", "")
+def _require(key: str) -> str:
+    val = os.environ.get(key, "")
+    if not val:
+        sys.exit(f"ERROR: {key} is not set. Check your .env file.")
+    return val
+
+def _load_config():
+    global TG_API_ID, TG_API_HASH, TG_PHONE, TG_DIALOG, ALBUM_NAME, NOTIFY_TOKEN, NOTIFY_CHAT
+    TG_API_ID    = int(_require("TG_API_ID"))
+    TG_API_HASH  = _require("TG_API_HASH")
+    TG_PHONE     = _require("TG_PHONE")
+    TG_DIALOG    = os.environ.get("TG_DIALOG", "@anna133456")
+    ALBUM_NAME   = os.environ.get("ALBUM_NAME", "Telegram - Anna")
+    NOTIFY_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
+    NOTIFY_CHAT  = os.environ.get("NOTIFY_CHAT_ID", "")
+
+TG_API_ID = TG_API_HASH = TG_PHONE = TG_DIALOG = ALBUM_NAME = NOTIFY_TOKEN = NOTIFY_CHAT = None
 
 GOOGLE_SCOPES = ["https://www.googleapis.com/auth/photoslibrary"]
 PHOTOS_BASE   = "https://photoslibrary.googleapis.com/v1"
@@ -321,6 +331,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     headless = not args.local_browser
+    _load_config()
 
     if args.auth_only:
         get_google_creds(headless=headless)
