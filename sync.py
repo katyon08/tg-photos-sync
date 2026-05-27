@@ -62,6 +62,52 @@ log = logging.getLogger("tg_sync")
 # ── Google Auth ───────────────────────────────────────────────────────────────
 
 GOOGLE_AUTH_PORT = 8080
+PENDING_URL_FILE = BASE_DIR / "pending_auth_url.txt"
+
+
+def _run_headless_auth(flow: InstalledAppFlow, port: int) -> Credentials:
+    """Start localhost HTTP server, print URL, wait for Google callback."""
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    result: dict = {}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            p = urllib.parse.urlparse(self.path)
+            result.update(urllib.parse.parse_qsl(p.query))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<h1>Auth complete! You can close this tab.</h1>")
+
+        def log_message(self, *_):
+            pass
+
+    flow.redirect_uri = f"http://localhost:{port}"
+    auth_url, _ = flow.authorization_url(prompt="consent")
+
+    # Write URL to file so it can be captured without PTY
+    PENDING_URL_FILE.write_text(auth_url + "\n")
+
+    print("\n" + "=" * 60, flush=True)
+    print("Open this URL in your browser:", flush=True)
+    print(auth_url, flush=True)
+    print("=" * 60, flush=True)
+    print(f"Waiting for Google redirect on localhost:{port} ...", flush=True)
+
+    server = HTTPServer(("localhost", port), _Handler)
+    server.handle_request()  # blocks until browser hits localhost:port
+
+    PENDING_URL_FILE.unlink(missing_ok=True)
+
+    if "error" in result:
+        sys.exit(f"OAuth error: {result['error']}")
+    if "code" not in result:
+        sys.exit("No auth code in callback.")
+
+    flow.fetch_token(code=result["code"])
+    return flow.credentials
 
 
 def get_google_creds(headless: bool = True) -> Credentials:
@@ -74,25 +120,9 @@ def get_google_creds(headless: bool = True) -> Credentials:
             log.info("Google token refreshed.")
         else:
             if not CREDS_FILE.exists():
-                sys.exit(f"ERROR: {CREDS_FILE} not found. Download OAuth2 Desktop credentials from Google Cloud Console.")
+                sys.exit(f"ERROR: {CREDS_FILE} not found.")
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_FILE), GOOGLE_SCOPES)
-            if headless:
-                # Headless: local HTTP server on fixed port, use SSH tunnel:
-                #   ssh -L 8080:localhost:8080 ubuntu@VM "python -u sync.py --auth-only"
-                # Then open the printed URL in your local browser.
-                creds = flow.run_local_server(
-                    port=GOOGLE_AUTH_PORT,
-                    open_browser=False,
-                    authorization_prompt_message=(
-                        "\n" + "=" * 60 + "\n"
-                        "Open this URL in your browser:\n\n"
-                        "{url}\n\n"
-                        "=" * 60 + "\n"
-                        "Waiting for Google redirect to localhost:8080 ...\n"
-                    ),
-                )
-            else:
-                creds = flow.run_local_server(port=0)
+            creds = _run_headless_auth(flow, GOOGLE_AUTH_PORT) if headless else flow.run_local_server(port=0)
         TOKEN_FILE.write_text(creds.to_json())
     return creds
 
