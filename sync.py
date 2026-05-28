@@ -50,6 +50,7 @@ TG_API_ID = TG_API_HASH = TG_PHONE = TG_DIALOG = ALBUM_NAME = NOTIFY_TOKEN = NOT
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
     "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
+    "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
 PHOTOS_BASE   = "https://photoslibrary.googleapis.com/v1"
 
