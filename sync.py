@@ -336,6 +336,7 @@ async def sync(headless: bool = True) -> tuple[int, int]:
                 errors += 1
                 log.warning("Upload failed for msg_id=%d", msg.id)
 
+            tmp_path.unlink(missing_ok=True)  # free disk immediately
             last_id = max(last_id, msg.id)
             save_state({"last_message_id": last_id})
 
