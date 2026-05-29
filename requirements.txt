@@ -3,3 +3,7 @@ google-auth-oauthlib>=1.2
 google-auth-httplib2>=0.2
 requests>=2.31
 python-dotenv>=1.0
+imagehash>=4.3
+Pillow>=10.0
+piexif>=1.1
+pillow-heif>=0.13

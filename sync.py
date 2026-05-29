@@ -1,42 +1,58 @@
 #!/usr/bin/env python3
-"""Sync media from a Telegram dialog to a Google Photos album."""
+"""Sync incoming Telegram media to Google Photos with deduplication."""
 
 import asyncio
+import io
 import json
 import logging
 import os
+import random
+import sqlite3
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+import imagehash
 import requests
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from PIL import Image
 from telethon import TelegramClient
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from telethon.utils import get_extension
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 load_dotenv(BASE_DIR / ".env")
 
-STATE_FILE  = BASE_DIR / "state.json"
-TOKEN_FILE  = BASE_DIR / "token_google.json"
-CREDS_FILE  = BASE_DIR / "credentials.json"
-SESSION_FILE = str(BASE_DIR / "tg")
-LOG_FILE    = BASE_DIR / "sync.log"
+DB_FILE       = BASE_DIR / "photos.db"
+LIB_INDEX_DB  = BASE_DIR / "library_index.db"
+TOKEN_FILE    = BASE_DIR / "token_google.json"
+CREDS_FILE    = BASE_DIR / "credentials.json"
+SESSION_FILE  = str(BASE_DIR / "tg")
+LOG_FILE      = BASE_DIR / "sync.log"
+PENDING_URL   = BASE_DIR / "pending_auth_url.txt"
 
 # ── Config ───────────────────────────────────────────────────────────────────
 def _require(key: str) -> str:
     val = os.environ.get(key, "")
     if not val:
-        sys.exit(f"ERROR: {key} is not set. Check your .env file.")
+        sys.exit(f"ERROR: {key} not set in .env")
     return val
 
 def _load_config():
-    global TG_API_ID, TG_API_HASH, TG_PHONE, TG_DIALOG, ALBUM_NAME, NOTIFY_TOKEN, NOTIFY_CHAT
+    global TG_API_ID, TG_API_HASH, TG_PHONE, TG_DIALOG
+    global ALBUM_NAME, NOTIFY_TOKEN, NOTIFY_CHAT
     TG_API_ID    = int(_require("TG_API_ID"))
     TG_API_HASH  = _require("TG_API_HASH")
     TG_PHONE     = _require("TG_PHONE")
@@ -45,16 +61,19 @@ def _load_config():
     NOTIFY_TOKEN = os.environ.get("NOTIFY_BOT_TOKEN", "")
     NOTIFY_CHAT  = os.environ.get("NOTIFY_CHAT_ID", "")
 
-TG_API_ID = TG_API_HASH = TG_PHONE = TG_DIALOG = ALBUM_NAME = NOTIFY_TOKEN = NOTIFY_CHAT = None
+TG_API_ID = TG_API_HASH = TG_PHONE = TG_DIALOG = None
+ALBUM_NAME = NOTIFY_TOKEN = NOTIFY_CHAT = None
 
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
     "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
-    "https://www.googleapis.com/auth/photoslibrary.readonly",
 ]
-PHOTOS_BASE   = "https://photoslibrary.googleapis.com/v1"
+PHOTOS_BASE      = "https://photoslibrary.googleapis.com/v1"
+GOOGLE_AUTH_PORT = 8080
+PHASH_THRESHOLD  = 8   # max Hamming distance to consider photos identical
+PROGRESS_INTERVAL = 3600  # report every hour (seconds)
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -63,14 +82,120 @@ logging.basicConfig(
 log = logging.getLogger("tg_sync")
 
 
+# ── SQLite DB ─────────────────────────────────────────────────────────────────
+
+def open_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id   INTEGER PRIMARY KEY,
+            sender_id    INTEGER,
+            is_outgoing  INTEGER,
+            message_date TEXT,
+            filename     TEXT,
+            file_size    INTEGER,
+            phash        TEXT,
+            google_id    TEXT,
+            status       TEXT  -- 'uploaded', 'skipped_outgoing', 'skipped_duplicate', 'error'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON messages(phash)")
+    conn.commit()
+    return conn
+
+
+def already_processed(conn: sqlite3.Connection, message_id: int) -> bool:
+    row = conn.execute(
+        "SELECT status FROM messages WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return row is not None
+
+
+def save_record(conn: sqlite3.Connection, **kwargs):
+    cols = ", ".join(kwargs.keys())
+    placeholders = ", ".join("?" * len(kwargs))
+    conn.execute(
+        f"INSERT OR REPLACE INTO messages ({cols}) VALUES ({placeholders})",
+        list(kwargs.values()),
+    )
+    conn.commit()
+
+
+def get_last_processed_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(message_id) FROM messages").fetchone()
+    return row[0] or 0
+
+
+# ── pHash helpers ─────────────────────────────────────────────────────────────
+
+def compute_phash(data: bytes) -> str | None:
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        return str(imagehash.phash(img))
+    except Exception:
+        return None
+
+
+def is_duplicate(phash_str: str, conn: sqlite3.Connection) -> bool:
+    """Check pHash against our own uploads AND the library index."""
+    h = imagehash.hex_to_hash(phash_str)
+
+    # Check our own uploaded photos
+    for (existing_hash,) in conn.execute(
+        "SELECT phash FROM messages WHERE phash IS NOT NULL AND status='uploaded'"
+    ):
+        try:
+            if (h - imagehash.hex_to_hash(existing_hash)) <= PHASH_THRESHOLD:
+                return True
+        except Exception:
+            pass
+
+    # Check against Google Takeout library index
+    if LIB_INDEX_DB.exists():
+        lib_conn = sqlite3.connect(f"file:{LIB_INDEX_DB}?mode=ro", uri=True)
+        for (existing_hash,) in lib_conn.execute("SELECT phash FROM library"):
+            try:
+                if (h - imagehash.hex_to_hash(existing_hash)) <= PHASH_THRESHOLD:
+                    lib_conn.close()
+                    return True
+            except Exception:
+                pass
+        lib_conn.close()
+
+    return False
+
+
+# ── EXIF date injection ───────────────────────────────────────────────────────
+
+def inject_exif_date(data: bytes, dt: datetime, filename: str) -> bytes:
+    """Inject DateTimeOriginal into JPEG/WebP EXIF. Returns original bytes if unsupported."""
+    ext = Path(filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".webp"}:
+        return data
+    try:
+        import piexif
+        date_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+        try:
+            exif_dict = piexif.load(data)
+        except Exception:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = date_str.encode()
+        exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = date_str.encode()
+        exif_bytes = piexif.dump(exif_dict)
+
+        img = Image.open(io.BytesIO(data))
+        out = io.BytesIO()
+        img.save(out, format=img.format or "JPEG", exif=exif_bytes)
+        return out.getvalue()
+    except Exception as e:
+        log.debug("EXIF inject failed for %s: %s", filename, e)
+        return data
+
+
 # ── Google Auth ───────────────────────────────────────────────────────────────
 
-GOOGLE_AUTH_PORT = 8080
-PENDING_URL_FILE = BASE_DIR / "pending_auth_url.txt"
-
-
 def _run_headless_auth(flow: InstalledAppFlow, port: int) -> Credentials:
-    """Start localhost HTTP server, print URL, wait for Google callback."""
     import urllib.parse
     from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -84,32 +209,25 @@ def _run_headless_auth(flow: InstalledAppFlow, port: int) -> Credentials:
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"<h1>Auth complete! You can close this tab.</h1>")
-
-        def log_message(self, *_):
-            pass
+        def log_message(self, *_): pass
 
     flow.redirect_uri = f"http://localhost:{port}"
     auth_url, _ = flow.authorization_url(prompt="consent")
-
-    # Write URL to file so it can be captured without PTY
-    PENDING_URL_FILE.write_text(auth_url + "\n")
-
+    PENDING_URL.write_text(auth_url + "\n")
     print("\n" + "=" * 60, flush=True)
     print("Open this URL in your browser:", flush=True)
     print(auth_url, flush=True)
     print("=" * 60, flush=True)
-    print(f"Waiting for Google redirect on localhost:{port} ...", flush=True)
+    print(f"Waiting on localhost:{port} ...", flush=True)
 
     server = HTTPServer(("localhost", port), _Handler)
-    server.handle_request()  # blocks until browser hits localhost:port
-
-    PENDING_URL_FILE.unlink(missing_ok=True)
+    server.handle_request()
+    PENDING_URL.unlink(missing_ok=True)
 
     if "error" in result:
         sys.exit(f"OAuth error: {result['error']}")
     if "code" not in result:
-        sys.exit("No auth code in callback.")
-
+        sys.exit("No auth code received.")
     flow.fetch_token(code=result["code"])
     return flow.credentials
 
@@ -141,7 +259,6 @@ def _auth_headers(creds: Credentials) -> dict:
 # ── Google Photos helpers ─────────────────────────────────────────────────────
 
 def find_or_create_album(creds: Credentials, title: str) -> tuple[str, str]:
-    """Return (albumId, productUrl). Creates album if not found."""
     params: dict = {"pageSize": 50}
     while True:
         r = requests.get(f"{PHOTOS_BASE}/albums", headers=_auth_headers(creds), params=params)
@@ -149,7 +266,7 @@ def find_or_create_album(creds: Credentials, title: str) -> tuple[str, str]:
         data = r.json()
         for album in data.get("albums", []):
             if album.get("title") == title:
-                log.info("Found existing album: %s", title)
+                log.info("Found album: %s", title)
                 return album["id"], album.get("productUrl", "")
         token = data.get("nextPageToken")
         if not token:
@@ -163,42 +280,12 @@ def find_or_create_album(creds: Credentials, title: str) -> tuple[str, str]:
     )
     r.raise_for_status()
     album = r.json()
-    log.info("Created new album: %s", title)
+    log.info("Created album: %s", title)
     return album["id"], album.get("productUrl", "")
 
 
-def get_last_synced_id_from_album(creds: Credentials, album_id: str) -> int:
-    """Scan album filenames (tg_MSGID_DATE.ext) to find max Telegram message ID."""
-    max_id = 0
-    body: dict = {"albumId": album_id, "pageSize": 100}
-    while True:
-        r = requests.post(
-            f"{PHOTOS_BASE}/mediaItems:search",
-            headers={**_auth_headers(creds), "Content-Type": "application/json"},
-            json=body,
-        )
-        r.raise_for_status()
-        data = r.json()
-        for item in data.get("mediaItems", []):
-            fname = item.get("filename", "")
-            # filename: tg_<msg_id>_<date>.<ext>
-            if fname.startswith("tg_"):
-                parts = fname.split("_")
-                if len(parts) >= 2:
-                    try:
-                        max_id = max(max_id, int(parts[1]))
-                    except ValueError:
-                        pass
-        token = data.get("nextPageToken")
-        if not token:
-            break
-        body["pageToken"] = token
-    return max_id
-
-
-def upload_to_album(creds: Credentials, album_id: str, file_path: Path, filename: str) -> bool:
-    """Upload a single file and add it to the album. Returns True on success."""
-    # Step 1: upload bytes → upload token
+def upload_to_album(creds: Credentials, album_id: str, data: bytes, filename: str) -> str | None:
+    """Upload bytes to Google Photos. Returns google media item ID or None."""
     r = requests.post(
         f"{PHOTOS_BASE}/uploads",
         headers={
@@ -207,24 +294,18 @@ def upload_to_album(creds: Credentials, album_id: str, file_path: Path, filename
             "X-Goog-Upload-File-Name": filename,
             "X-Goog-Upload-Protocol": "raw",
         },
-        data=file_path.read_bytes(),
+        data=data,
         timeout=120,
     )
     r.raise_for_status()
     upload_token = r.text.strip()
 
-    # Step 2: create media item in album
     r = requests.post(
         f"{PHOTOS_BASE}/mediaItems:batchCreate",
         headers={**_auth_headers(creds), "Content-Type": "application/json"},
         json={
             "albumId": album_id,
-            "newMediaItems": [{
-                "simpleMediaItem": {
-                    "uploadToken": upload_token,
-                    "fileName": filename,
-                }
-            }],
+            "newMediaItems": [{"simpleMediaItem": {"uploadToken": upload_token, "fileName": filename}}],
         },
         timeout=30,
     )
@@ -232,28 +313,18 @@ def upload_to_album(creds: Credentials, album_id: str, file_path: Path, filename
     results = r.json().get("newMediaItemResults", [])
     if results:
         status = results[0].get("status", {})
-        if status.get("message") == "Success":
-            return True
+        media_item = results[0].get("mediaItem", {})
+        if media_item.get("id"):
+            return media_item["id"]
+        if not status.get("code"):  # code 0 or absent = success
+            return results[0].get("uploadToken", upload_token)
         log.warning("Upload status: %s", status)
-    return False
-
-
-# ── State ─────────────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
-
-
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    return None
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def _is_syncable(msg) -> tuple[bool, str]:
-    """Return (should_sync, media_type)."""
     if isinstance(msg.media, MessageMediaPhoto):
         return True, "photo"
     if isinstance(msg.media, MessageMediaDocument):
@@ -266,99 +337,21 @@ def _is_syncable(msg) -> tuple[bool, str]:
     return False, ""
 
 
-# ── Main sync ─────────────────────────────────────────────────────────────────
+# ── Progress notification ─────────────────────────────────────────────────────
 
-async def sync(headless: bool = True) -> tuple[int, int]:
-    log.info("=== tg-photos-sync started ===")
-
-    creds = get_google_creds(headless=headless)
-    album_id, album_url = find_or_create_album(creds, ALBUM_NAME)
-
-    state = load_state()
-    if "last_message_id" in state:
-        min_id = state["last_message_id"]
-        log.info("Resuming from state.json: last_message_id=%d", min_id)
-    else:
-        # First run: scan album to find already-synced messages
-        min_id = get_last_synced_id_from_album(creds, album_id)
-        log.info("No state.json — scanned album, starting after message_id=%d", min_id)
-
-    client = TelegramClient(SESSION_FILE, TG_API_ID, TG_API_HASH)
-    await client.start(phone=TG_PHONE)
-
-    entity = await client.get_entity(TG_DIALOG)
-    log.info("Dialog resolved: %s", entity)
-
-    uploaded = 0
-    errors = 0
-    last_id = min_id
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        async for msg in client.iter_messages(entity, min_id=min_id, reverse=True):
-            should_sync, media_type = _is_syncable(msg)
-            if not should_sync:
-                last_id = max(last_id, msg.id)
-                continue
-
-            ext = get_extension(msg.media) or ".bin"
-            filename = f"tg_{msg.id}_{msg.date.strftime('%Y%m%d_%H%M%S')}{ext}"
-            tmp_path = Path(tmpdir) / filename
-
-            log.info("Downloading %s msg_id=%d ...", media_type, msg.id)
-            try:
-                await client.download_media(msg, file=str(tmp_path))
-            except Exception as e:
-                log.error("Download error msg_id=%d: %s", msg.id, e)
-                errors += 1
-                last_id = max(last_id, msg.id)
-                save_state({"last_message_id": last_id})
-                continue
-
-            if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-                log.warning("Empty download for msg_id=%d, skipping", msg.id)
-                errors += 1
-                last_id = max(last_id, msg.id)
-                save_state({"last_message_id": last_id})
-                continue
-
-            try:
-                ok = upload_to_album(creds, album_id, tmp_path, filename)
-            except Exception as e:
-                log.error("Upload error msg_id=%d: %s", msg.id, e)
-                errors += 1
-                last_id = max(last_id, msg.id)
-                save_state({"last_message_id": last_id})
-                continue
-
-            if ok:
-                uploaded += 1
-                log.info("OK %s (%d bytes)", filename, tmp_path.stat().st_size)
-            else:
-                errors += 1
-                log.warning("Upload failed for msg_id=%d", msg.id)
-
-            tmp_path.unlink(missing_ok=True)  # free disk immediately
-            last_id = max(last_id, msg.id)
-            save_state({"last_message_id": last_id})
-
-    await client.disconnect()
-    save_state({"last_message_id": last_id})
-    log.info("Done: uploaded=%d errors=%d last_message_id=%d", uploaded, errors, last_id)
-
-    _notify(uploaded, errors, album_url)
-    return uploaded, errors
-
-
-# ── Notification ──────────────────────────────────────────────────────────────
-
-def _notify(uploaded: int, errors: int, album_url: str) -> None:
+def send_progress(uploaded: int, skipped_dup: int, skipped_out: int,
+                  errors: int, total_estimate: int,
+                  current_date: str, sample_photos: list[bytes]):
     if not NOTIFY_TOKEN or not NOTIFY_CHAT:
         return
-    status = "OK" if errors == 0 else f"WARNING: {errors} errors"
+    processed = uploaded + skipped_dup + skipped_out + errors
+    pct = int(processed * 100 / total_estimate) if total_estimate else 0
     text = (
-        f"TG Photos Sync [{status}]\n"
-        f"Загружено новых файлов: {uploaded}\n"
-        f"Альбом: {album_url or ALBUM_NAME}"
+        f"📸 Sync прогресс\n"
+        f"Загружено: {uploaded} | Дубликаты: {skipped_dup} | Пропущено: {skipped_out}\n"
+        f"Ошибок: {errors}\n"
+        f"Обработано: {processed:,} / ~{total_estimate:,} ({pct}%)\n"
+        f"Текущий период: {current_date}"
     )
     try:
         requests.post(
@@ -366,27 +359,168 @@ def _notify(uploaded: int, errors: int, album_url: str) -> None:
             json={"chat_id": NOTIFY_CHAT, "text": text},
             timeout=10,
         )
+        for photo_data in sample_photos[:3]:
+            requests.post(
+                f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendPhoto",
+                data={"chat_id": NOTIFY_CHAT},
+                files={"photo": ("sample.jpg", photo_data, "image/jpeg")},
+                timeout=30,
+            )
     except Exception as e:
-        log.warning("Notification failed: %s", e)
+        log.warning("Progress notification failed: %s", e)
+
+
+# ── Main sync ─────────────────────────────────────────────────────────────────
+
+async def sync(headless: bool = True):
+    log.info("=== tg-photos-sync started ===")
+
+    creds = get_google_creds(headless=headless)
+    album_id, album_url = find_or_create_album(creds, ALBUM_NAME)
+    conn = open_db()
+
+    min_id = get_last_processed_id(conn)
+    log.info("Resuming after message_id=%d", min_id)
+
+    client = TelegramClient(SESSION_FILE, TG_API_ID, TG_API_HASH)
+    await client.start(phone=TG_PHONE)
+    entity = await client.get_entity(TG_DIALOG)
+    log.info("Dialog: %s", entity)
+
+    # Estimate total for progress reporting
+    total_msgs = (await client.get_messages(entity, limit=1))[0].id if True else 0
+    total_estimate = max(total_msgs - min_id, 1)
+
+    uploaded = skipped_dup = skipped_out = errors = 0
+    last_progress_time = time.time()
+    sample_buffer: list[bytes] = []  # random samples for progress report
+
+    async for msg in client.iter_messages(entity, min_id=min_id, reverse=True):
+        if already_processed(conn, msg.id):
+            continue
+
+        should_sync, media_type = _is_syncable(msg)
+        if not should_sync:
+            continue
+
+        # Skip outgoing messages (photos user sent)
+        if msg.out:
+            save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                        is_outgoing=1, message_date=str(msg.date),
+                        status="skipped_outgoing")
+            skipped_out += 1
+            continue
+
+        # Download media into memory
+        log.info("Downloading %s msg_id=%d date=%s ...", media_type, msg.id, msg.date.date())
+        try:
+            buf = io.BytesIO()
+            await client.download_media(msg, file=buf)
+            data = buf.getvalue()
+        except Exception as e:
+            log.error("Download error msg_id=%d: %s", msg.id, e)
+            save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                        is_outgoing=0, message_date=str(msg.date), status="error")
+            errors += 1
+            continue
+
+        if not data:
+            errors += 1
+            continue
+
+        # pHash deduplication
+        phash = None
+        if media_type in ("photo", "image"):
+            phash = compute_phash(data)
+            if phash and is_duplicate(phash, conn):
+                log.info("Duplicate skipped msg_id=%d", msg.id)
+                save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                            is_outgoing=0, message_date=str(msg.date),
+                            phash=phash, status="skipped_duplicate")
+                skipped_dup += 1
+                continue
+
+        # Inject EXIF date
+        ext = get_extension(msg.media) or ".bin"
+        filename = f"tg_{msg.id}_{msg.date.strftime('%Y%m%d_%H%M%S')}{ext}"
+        if media_type in ("photo", "image"):
+            data = inject_exif_date(data, msg.date, filename)
+
+        # Upload
+        try:
+            google_id = upload_to_album(creds, album_id, data, filename)
+        except Exception as e:
+            log.error("Upload error msg_id=%d: %s", msg.id, e)
+            save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                        is_outgoing=0, message_date=str(msg.date),
+                        phash=phash, status="error")
+            errors += 1
+            continue
+
+        if google_id:
+            save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                        is_outgoing=0, message_date=str(msg.date),
+                        filename=filename, file_size=len(data),
+                        phash=phash, google_id=google_id, status="uploaded")
+            uploaded += 1
+            log.info("OK %s", filename)
+
+            # Keep random sample for progress report
+            if media_type in ("photo", "image") and random.random() < 0.05:
+                sample_buffer.append(data)
+                if len(sample_buffer) > 20:
+                    sample_buffer.pop(random.randint(0, len(sample_buffer) - 2))
+        else:
+            save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
+                        is_outgoing=0, message_date=str(msg.date),
+                        phash=phash, status="error")
+            errors += 1
+
+        # Hourly progress report
+        if time.time() - last_progress_time >= PROGRESS_INTERVAL:
+            samples = random.sample(sample_buffer, min(3, len(sample_buffer)))
+            send_progress(uploaded, skipped_dup, skipped_out, errors,
+                          total_estimate, str(msg.date.date()), samples)
+            last_progress_time = time.time()
+
+    await client.disconnect()
+    conn.close()
+
+    log.info("Done: uploaded=%d dup=%d out=%d errors=%d",
+             uploaded, skipped_dup, skipped_out, errors)
+
+    # Final notification
+    if NOTIFY_TOKEN and NOTIFY_CHAT:
+        text = (
+            f"✅ Sync завершён\n"
+            f"Загружено: {uploaded}\n"
+            f"Дубликаты пропущены: {skipped_dup}\n"
+            f"Исходящие пропущены: {skipped_out}\n"
+            f"Ошибок: {errors}\n"
+            f"Альбом: {album_url}"
+        )
+        requests.post(
+            f"https://api.telegram.org/bot{NOTIFY_TOKEN}/sendMessage",
+            json={"chat_id": NOTIFY_CHAT, "text": text},
+            timeout=10,
+        )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Sync Telegram media to Google Photos")
-    parser.add_argument("--auth-only", action="store_true", help="Run auth flows and exit")
-    parser.add_argument("--local-browser", action="store_true", help="Use local browser for Google OAuth (default: console/headless)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--auth-only", action="store_true")
+    parser.add_argument("--local-browser", action="store_true")
     args = parser.parse_args()
 
-    headless = not args.local_browser
     _load_config()
+    headless = not args.local_browser
 
     if args.auth_only:
         get_google_creds(headless=headless)
-        print("Google auth complete — token_google.json saved.")
-        print("Now run without --auth-only to do Telegram auth + first sync.")
+        print("Google auth complete.")
         sys.exit(0)
 
     asyncio.run(sync(headless=headless))
