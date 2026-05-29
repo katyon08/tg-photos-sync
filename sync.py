@@ -136,9 +136,29 @@ def compute_phash(data: bytes) -> str | None:
         return None
 
 
-def is_duplicate(phash_str: str, conn: sqlite3.Connection) -> bool:
-    """Check pHash against our own uploads AND the library index."""
+COLOR_THRESHOLD = 30  # max RGB channel diff to bother with pHash
+
+
+def _avg_color(data: bytes) -> tuple[int, int, int] | None:
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB").resize((1, 1), Image.LANCZOS)
+        return img.getpixel((0, 0))
+    except Exception:
+        return None
+
+
+def _color_close(r: int, g: int, b: int, er, eg, eb) -> bool:
+    if er is None:
+        return True  # no color in DB → don't skip, fall through to pHash
+    return (abs(r - er) <= COLOR_THRESHOLD and
+            abs(g - eg) <= COLOR_THRESHOLD and
+            abs(b - eb) <= COLOR_THRESHOLD)
+
+
+def is_duplicate(phash_str: str, avg: tuple | None, conn: sqlite3.Connection) -> bool:
+    """Check pHash (with avg color pre-filter) against own uploads and library index."""
     h = imagehash.hex_to_hash(phash_str)
+    r, g, b = avg if avg else (0, 0, 0)
 
     # Check our own uploaded photos
     for (existing_hash,) in conn.execute(
@@ -150,11 +170,15 @@ def is_duplicate(phash_str: str, conn: sqlite3.Connection) -> bool:
         except Exception:
             pass
 
-    # Check against Google Takeout library index
+    # Check against Google Takeout library index (with avg color pre-filter)
     if LIB_INDEX_DB.exists():
         lib_conn = sqlite3.connect(f"file:{LIB_INDEX_DB}?mode=ro", uri=True)
-        for (existing_hash,) in lib_conn.execute("SELECT phash FROM library"):
+        for (existing_hash, er, eg, eb) in lib_conn.execute(
+            "SELECT phash, avg_r, avg_g, avg_b FROM library"
+        ):
             try:
+                if not _color_close(r, g, b, er, eg, eb):
+                    continue  # colours too different → skip pHash entirely
                 if (h - imagehash.hex_to_hash(existing_hash)) <= PHASH_THRESHOLD:
                     lib_conn.close()
                     return True
@@ -428,11 +452,13 @@ async def sync(headless: bool = True):
             errors += 1
             continue
 
-        # pHash deduplication
+        # pHash deduplication (with avg color pre-filter)
         phash = None
+        avg = None
         if media_type in ("photo", "image"):
             phash = compute_phash(data)
-            if phash and is_duplicate(phash, conn):
+            avg = _avg_color(data)
+            if phash and is_duplicate(phash, avg, conn):
                 log.info("Duplicate skipped msg_id=%d", msg.id)
                 save_record(conn, message_id=msg.id, sender_id=msg.sender_id,
                             is_outgoing=0, message_date=str(msg.date),

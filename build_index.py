@@ -81,7 +81,10 @@ def init_db(conn: sqlite3.Connection):
             gps_lon   REAL,
             width     INTEGER,
             height    INTEGER,
-            file_size INTEGER
+            file_size INTEGER,
+            avg_r     INTEGER,
+            avg_g     INTEGER,
+            avg_b     INTEGER
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON library(phash)")
@@ -89,16 +92,28 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
+def avg_color(img: Image.Image) -> tuple[int, int, int]:
+    """Compute average RGB by resizing to 1x1."""
+    pixel = img.convert("RGB").resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+    return pixel  # (r, g, b)
+
+
 def compute_phash_and_meta(data: bytes) -> tuple[str | None, dict]:
     try:
         img = Image.open(io.BytesIO(data))
+        rgb = img.convert("RGB")
         meta = extract_exif(img)
         meta["file_size"] = len(data)
-        phash = str(imagehash.phash(img.convert("RGB")))
+        r, g, b = avg_color(rgb)
+        meta["avg_r"] = r
+        meta["avg_g"] = g
+        meta["avg_b"] = b
+        phash = str(imagehash.phash(rgb))
         return phash, meta
     except Exception:
         return None, {"exif_date": None, "gps_lat": None, "gps_lon": None,
-                      "width": None, "height": None, "file_size": len(data)}
+                      "width": None, "height": None, "file_size": len(data),
+                      "avg_r": None, "avg_g": None, "avg_b": None}
 
 
 def index_archive(archive_path: Path, conn: sqlite3.Connection):
@@ -129,11 +144,12 @@ def index_archive(archive_path: Path, conn: sqlite3.Connection):
                 conn.execute(
                     """INSERT INTO library
                        (filename, phash, archive, exif_date, gps_lat, gps_lon,
-                        width, height, file_size)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        width, height, file_size, avg_r, avg_g, avg_b)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (filename, phash, archive_name,
                      meta["exif_date"], meta["gps_lat"], meta["gps_lon"],
-                     meta["width"], meta["height"], meta["file_size"]),
+                     meta["width"], meta["height"], meta["file_size"],
+                     meta["avg_r"], meta["avg_g"], meta["avg_b"]),
                 )
                 indexed += 1
                 if indexed % 1000 == 0:
