@@ -15,7 +15,7 @@ import zipfile
 from pathlib import Path
 
 import imagehash
-from PIL import Image
+from PIL import Image, ExifTags
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
@@ -25,27 +25,80 @@ except ImportError:
 DB_PATH = Path(__file__).parent / "library_index.db"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".gif", ".tiff", ".bmp"}
 
+# EXIF tag IDs
+_TAG_DATE    = 36867  # DateTimeOriginal
+_TAG_GPS     = 34853  # GPSInfo
+_GPS_LAT     = 2
+_GPS_LAT_REF = 1
+_GPS_LON     = 4
+_GPS_LON_REF = 3
+
+
+def _dms_to_decimal(dms, ref: str) -> float | None:
+    try:
+        d, m, s = dms
+        val = float(d) + float(m) / 60 + float(s) / 3600
+        if ref in ("S", "W"):
+            val = -val
+        return round(val, 6)
+    except Exception:
+        return None
+
+
+def extract_exif(img: Image.Image) -> dict:
+    """Extract DateTimeOriginal and GPS from Pillow image."""
+    result = {"exif_date": None, "gps_lat": None, "gps_lon": None,
+              "width": img.width, "height": img.height}
+    try:
+        raw = img.getexif()
+        if not raw:
+            return result
+        # Date
+        date_val = raw.get(_TAG_DATE)
+        if date_val:
+            result["exif_date"] = str(date_val).strip()
+        # GPS
+        gps_data = raw.get_ifd(_TAG_GPS)
+        if gps_data:
+            lat = _dms_to_decimal(gps_data.get(_GPS_LAT), gps_data.get(_GPS_LAT_REF, "N"))
+            lon = _dms_to_decimal(gps_data.get(_GPS_LON), gps_data.get(_GPS_LON_REF, "E"))
+            result["gps_lat"] = lat
+            result["gps_lon"] = lon
+    except Exception:
+        pass
+    return result
+
 
 def init_db(conn: sqlite3.Connection):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS library (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            phash    TEXT NOT NULL,
-            archive  TEXT
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename  TEXT NOT NULL,
+            phash     TEXT NOT NULL,
+            archive   TEXT,
+            exif_date TEXT,
+            gps_lat   REAL,
+            gps_lon   REAL,
+            width     INTEGER,
+            height    INTEGER,
+            file_size INTEGER
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON library(phash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_date  ON library(exif_date)")
     conn.commit()
 
 
-def compute_phash(data: bytes) -> str | None:
+def compute_phash_and_meta(data: bytes) -> tuple[str | None, dict]:
     try:
         img = Image.open(io.BytesIO(data))
-        img = img.convert("RGB")
-        return str(imagehash.phash(img))
+        meta = extract_exif(img)
+        meta["file_size"] = len(data)
+        phash = str(imagehash.phash(img.convert("RGB")))
+        return phash, meta
     except Exception:
-        return None
+        return None, {"exif_date": None, "gps_lat": None, "gps_lon": None,
+                      "width": None, "height": None, "file_size": len(data)}
 
 
 def index_archive(archive_path: Path, conn: sqlite3.Connection):
@@ -69,18 +122,23 @@ def index_archive(archive_path: Path, conn: sqlite3.Connection):
             filename = Path(entry.filename).name
             try:
                 data = zf.read(entry.filename)
-                phash = compute_phash(data)
+                phash, meta = compute_phash_and_meta(data)
                 if phash is None:
                     skipped += 1
                     continue
                 conn.execute(
-                    "INSERT INTO library (filename, phash, archive) VALUES (?, ?, ?)",
-                    (filename, phash, archive_name),
+                    """INSERT INTO library
+                       (filename, phash, archive, exif_date, gps_lat, gps_lon,
+                        width, height, file_size)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (filename, phash, archive_name,
+                     meta["exif_date"], meta["gps_lat"], meta["gps_lon"],
+                     meta["width"], meta["height"], meta["file_size"]),
                 )
                 indexed += 1
                 if indexed % 1000 == 0:
                     conn.commit()
-            except Exception as e:
+            except Exception:
                 skipped += 1
 
     conn.commit()
